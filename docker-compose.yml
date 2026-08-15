@@ -1,0 +1,58 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_tutor
+      POSTGRES_PASSWORD: ai_tutor_dev_password
+      POSTGRES_DB: ai_tutor
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ai_tutor']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      DATABASE_URL: postgresql://ai_tutor:ai_tutor_dev_password@postgres:5432/ai_tutor?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      NEMOTRON_API_KEY: ${NEMOTRON_API_KEY}
+      NEMOTRON_BASE_URL: ${NEMOTRON_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NEMOTRON_MODEL: ${NEMOTRON_MODEL:-nvidia/llama-3.1-nemotron-70b-instruct}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: 3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  postgres_data:

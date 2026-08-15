@@ -1,0 +1,339 @@
+// ============================================================================
+// AI TUTOR DOMAIN MODELS
+// This is a fragment meant to be merged into your main schema.prisma
+// (which will also hold School, Board, Standard, Stream, User/Auth models
+// from the "data model + syllabus" phase). Only the models needed to
+// support the AI tutor logic layer are defined here.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Core reference entities (minimal stubs — fleshed out in the data-model phase)
+// ----------------------------------------------------------------------------
+
+model Student {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  standardId      String
+  streamId        String?
+  boardId         String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Aggregated, frequently-read state — denormalized on purpose so the
+  // dashboard and timetable generator don't have to recompute on every request.
+  attentionProfile   AttentionProfile?
+  creditWallet        CreditWallet?
+  topicMastery         TopicMastery[]
+  videoInteractions    VideoInteractionEvent[]
+  quizAttempts         QuizAttempt[]
+  revisionTests        RevisionTest[]
+  peerTeachingAsTutor  PeerTeachingSession[]  @relation("TutorSessions")
+  peerTeachingAsTutee  PeerTeachingSession[]  @relation("TuteeSessions")
+  studyGroupMemberships StudyGroupMember[]
+  creditTransactions    CreditTransaction[]
+  examRecords           ExamRecord[]
+  coCurricularRecords   CoCurricularRecord[]
+
+  @@index([standardId, boardId])
+}
+
+model Subject {
+  id       String   @id @default(uuid())
+  name     String
+  code     String   @unique
+  topics   Topic[]
+}
+
+model Topic {
+  id          String   @id @default(uuid())
+  subjectId   String
+  subject     Subject  @relation(fields: [subjectId], references: [id])
+  name        String
+  order       Int
+  // Topics are chained so weakness in a prerequisite can propagate a
+  // "review this first" signal forward.
+  prerequisiteTopicId String?
+  difficultyBaseline  Float   @default(0.5) // 0..1, curated/expert-set baseline
+
+  lectures       Lecture[]
+  topicMastery   TopicMastery[]
+  quizQuestions  QuizQuestion[]
+
+  @@index([subjectId])
+}
+
+model Lecture {
+  id         String   @id @default(uuid())
+  topicId    String
+  topic      Topic    @relation(fields: [topicId], references: [id])
+  title      String
+  videoUrl   String
+  durationSec Int
+
+  videoInteractions VideoInteractionEvent[]
+  revisionTests     RevisionTest[]
+
+  @@index([topicId])
+}
+
+// ----------------------------------------------------------------------------
+// Signal capture: video interaction events
+// One row per discrete event, not one row per lecture — this is what lets us
+// reconstruct pause/rewind/skip patterns per timestamp region later.
+// ----------------------------------------------------------------------------
+
+enum VideoEventType {
+  PLAY
+  PAUSE
+  REWIND
+  FAST_FORWARD
+  SKIP_SECTION
+  SPEED_CHANGE
+  COMPLETE
+  DROP_OFF // student closed/left without completing
+}
+
+model VideoInteractionEvent {
+  id          String         @id @default(uuid())
+  studentId   String
+  student     Student        @relation(fields: [studentId], references: [id])
+  lectureId   String
+  lecture     Lecture        @relation(fields: [lectureId], references: [id])
+  eventType   VideoEventType
+  atSecond    Int            // playhead position when event fired
+  toSecond    Int?           // for REWIND/FAST_FORWARD/SKIP: destination
+  playbackSpeed Float?       // for SPEED_CHANGE
+  createdAt   DateTime       @default(now())
+
+  @@index([studentId, lectureId])
+  @@index([lectureId, atSecond])
+}
+
+// ----------------------------------------------------------------------------
+// Assessment: quizzes, revision tests, exam records
+// ----------------------------------------------------------------------------
+
+model QuizQuestion {
+  id         String   @id @default(uuid())
+  topicId    String
+  topic      Topic    @relation(fields: [topicId], references: [id])
+  prompt     String
+  options    Json     // [{id, text}]
+  correctOptionId String
+  difficulty Float    @default(0.5) // 0..1
+
+  quizAnswers QuizAnswer[]
+}
+
+model QuizAttempt {
+  id         String   @id @default(uuid())
+  studentId  String
+  student    Student  @relation(fields: [studentId], references: [id])
+  startedAt  DateTime @default(now())
+  finishedAt DateTime?
+  score      Float?   // 0..1, computed on completion
+  answers    QuizAnswer[]
+}
+
+model QuizAnswer {
+  id             String       @id @default(uuid())
+  attemptId      String
+  attempt        QuizAttempt  @relation(fields: [attemptId], references: [id])
+  questionId     String
+  question       QuizQuestion @relation(fields: [questionId], references: [id])
+  selectedOptionId String?
+  isCorrect      Boolean
+  timeTakenMs    Int
+}
+
+// A RevisionTest is the short check-for-understanding fired automatically
+// after a lecture finishes (or after a DROP_OFF/weak-signal is detected).
+model RevisionTest {
+  id          String   @id @default(uuid())
+  studentId   String
+  student     Student  @relation(fields: [studentId], references: [id])
+  lectureId   String
+  lecture     Lecture  @relation(fields: [lectureId], references: [id])
+  triggeredBy RevisionTestTrigger
+  questions   Json     // snapshot of generated/selected questions
+  responses   Json?    // student's answers
+  score       Float?   // 0..1
+  nemotronFeedback Json? // structured feedback from Nemotron evaluation
+  createdAt   DateTime @default(now())
+  completedAt DateTime?
+
+  @@index([studentId, lectureId])
+}
+
+enum RevisionTestTrigger {
+  POST_LECTURE
+  WEAKNESS_DETECTED
+  SCHEDULED_REVIEW // spaced-repetition driven
+}
+
+model ExamRecord {
+  id         String   @id @default(uuid())
+  studentId  String
+  student    Student  @relation(fields: [studentId], references: [id])
+  subjectId  String
+  examName   String
+  marksObtained Float
+  maxMarks   Float
+  examDate   DateTime
+
+  @@index([studentId, subjectId])
+}
+
+model CoCurricularRecord {
+  id          String   @id @default(uuid())
+  studentId   String
+  student     Student  @relation(fields: [studentId], references: [id])
+  activityName String
+  category    String   // sports / arts / debate / robotics / etc.
+  level       String   // school / district / state / national
+  achievedAt  DateTime
+  notes       String?
+}
+
+// ----------------------------------------------------------------------------
+// Derived state: topic mastery, attention profile
+// These are the tables the recommendation/timetable engine reads from — kept
+// small and hot, recomputed by the scoring services below rather than
+// joined/aggregated live on every request.
+// ----------------------------------------------------------------------------
+
+enum MasteryLevel {
+  WEAK
+  DEVELOPING
+  PROFICIENT
+  STRONG
+}
+
+model TopicMastery {
+  id            String       @id @default(uuid())
+  studentId     String
+  student       Student      @relation(fields: [studentId], references: [id])
+  topicId       String
+  topic         Topic        @relation(fields: [topicId], references: [id])
+  masteryScore  Float        @default(0.5) // 0..1, EWMA-updated
+  masteryLevel  MasteryLevel @default(DEVELOPING)
+  confidence    Float        @default(0.3) // how much evidence backs the score, 0..1
+  lastEvaluatedAt DateTime   @default(now())
+  needsReview   Boolean      @default(false)
+  consecutiveFailures Int    @default(0)
+
+  @@unique([studentId, topicId])
+  @@index([studentId, needsReview])
+}
+
+model AttentionProfile {
+  id                  String   @id @default(uuid())
+  studentId           String   @unique
+  student             Student  @relation(fields: [studentId], references: [id])
+  estimatedAttentionSpanSec Int  @default(900) // rolling estimate, e.g. 15 min
+  memoryRetentionScore Float   @default(0.5)   // 0..1, from spaced-repetition test decay
+  bestFocusWindowStart Int?    // hour of day, 0-23, from historical engagement
+  bestFocusWindowEnd   Int?
+  updatedAt           DateTime @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// Study groups & peer teaching
+// ----------------------------------------------------------------------------
+
+model StudyGroup {
+  id         String   @id @default(uuid())
+  name       String
+  subjectId  String
+  standardId String
+  boardId    String
+  createdAt  DateTime @default(now())
+
+  members StudyGroupMember[]
+}
+
+model StudyGroupMember {
+  id           String     @id @default(uuid())
+  studyGroupId String
+  studyGroup   StudyGroup @relation(fields: [studyGroupId], references: [id])
+  studentId    String
+  student      Student    @relation(fields: [studentId], references: [id])
+  joinedAt     DateTime   @default(now())
+
+  @@unique([studyGroupId, studentId])
+}
+
+enum PeerTeachingOutcome {
+  PENDING
+  IMPROVED
+  NOT_IMPROVED
+  ESCALATED_TO_PEER
+}
+
+model PeerTeachingSession {
+  id           String   @id @default(uuid())
+  topicId      String
+  tutorId      String   // the stronger student, or "AI" sentinel when teach-back is to the AI
+  tutor        Student? @relation("TutorSessions", fields: [tutorId], references: [id])
+  isAiTutor    Boolean  @default(false)
+  tuteeId      String
+  tutee        Student  @relation("TuteeSessions", fields: [tuteeId], references: [id])
+  transcript   Json?    // what the "teaching" student explained
+  nemotronEvaluation Json? // structured judgement: gaps found, quality score
+  outcome      PeerTeachingOutcome @default(PENDING)
+  createdAt    DateTime @default(now())
+  resolvedAt   DateTime?
+
+  @@index([tuteeId, topicId])
+}
+
+// ----------------------------------------------------------------------------
+// Credits & rewards
+// ----------------------------------------------------------------------------
+
+enum CreditReason {
+  QUIZ_COMPLETED
+  REVISION_TEST_PASSED
+  TAUGHT_AI_SUCCESSFULLY
+  TAUGHT_PEER_SUCCESSFULLY
+  PEER_IMPROVED_AFTER_TEACHING // bonus once the tutee's mastery actually rises
+  STREAK_BONUS
+  REDEEMED
+}
+
+model CreditWallet {
+  id        String   @id @default(uuid())
+  studentId String   @unique
+  student   Student  @relation(fields: [studentId], references: [id])
+  balance   Int      @default(0)
+  lifetimeEarned Int @default(0)
+  updatedAt DateTime @updatedAt
+}
+
+model CreditTransaction {
+  id        String       @id @default(uuid())
+  studentId String
+  student   Student      @relation(fields: [studentId], references: [id])
+  amount    Int          // positive = earn, negative = redeem
+  reason    CreditReason
+  refId     String?      // id of the quiz/test/session that triggered this
+  createdAt DateTime     @default(now())
+}
+
+model RewardCatalogItem {
+  id          String   @id @default(uuid())
+  name        String
+  description String
+  creditCost  Int
+  stock       Int
+  active      Boolean  @default(true)
+}
